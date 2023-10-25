@@ -21,20 +21,22 @@ function generate_accessors(filename)
     # traverse all its child nodes and print element names
     for e in child_elements(xroot)  # c is an instance of XMLNode
         if name(e) == "include"
+            @info "including linked file"
             href = attribute(e, "href")
             dtype_map = load_dtypes(href)
             dtype_map = merge(primitive_type_map, dtype_map)
-            display(dtype_map)
         end
         if name(e) == "message"
             message_name = attribute(e, "name")
             message_description = attribute(e, "description")
+            @info "message type" message_name message_description
             fields = parse_message(e, dtype_map)
             generate_struct(message_name, message_description, fields)
         end
     end
     free(xdoc)
 
+    nothing
 end
 
 function load_dtypes(href)
@@ -92,21 +94,23 @@ function make_composite_type(element, fields)
     type_name = attribute(element, "name")
     type_description = attribute(element, "description")
     
-    @eval begin
+    @eval Main begin
         # Put description field into docstring
         $type_description
-        struct $(Symbol(type_name)){T<: AbstractArray{UInt8}} <: CompositeDType
+        struct $(Symbol(type_name)){T<: AbstractArray{UInt8}} <: $(CompositeDType)
             buffer::T
         end
     end
     
     # For autocomplete etc.
-    @eval function Base.propertynames(sbe::$(Symbol(type_name)))
+    @eval Main function Base.propertynames(sbe::$(Symbol(type_name)))
         props = ($(
             (Meta.quot(Symbol(field.name)) for field in fields
         )...),)
         return props
     end
+
+    @info "main eval $type_name"
 
     # For property access
     # construct expressions for each field access 
@@ -118,7 +122,7 @@ function make_composite_type(element, fields)
             end
         end
     end
-    @eval function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
+    @eval Main function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
         $(field_access_exprs...)
         error(lazy"type has no property $prop")
     end
@@ -136,18 +140,19 @@ function make_composite_type(element, fields)
             end
         end
     end
-    @eval function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
+    @eval Main function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
         $(field_access_exprs...)
         error(lazy"type has no property $prop")
     end
 
-    return @eval $(Symbol(type_name))
+    return @eval Main $(Symbol(type_name))
 
 end
 
 function generate_struct(message_name, message_description, fields)
+    @info "generate struct " message_name
 
-    @eval begin
+    @eval Main begin
         # Put description field into docstring
         $message_description
         struct $(Symbol(message_name)){T<: AbstractArray{UInt8}}
@@ -156,7 +161,7 @@ function generate_struct(message_name, message_description, fields)
     end
     
     # For autocomplete etc.
-    @eval function Base.propertynames(sbe::$(Symbol(message_name)))
+    @eval Main function Base.propertynames(sbe::$(Symbol(message_name)))
         props = ($(
             (Meta.quot(Symbol(field.name)) for field in fields
         )...),)
@@ -171,50 +176,64 @@ function generate_struct(message_name, message_description, fields)
     # We build up a list of expressions calculating offsets as we go.
     # Each subsequent field adds their calculation to the offsets as a 
     # new expression.
-    offset_calc_exprs = Expr[:(offset = 1)]
-
+    offset_calc_exprs = Expr[:(offset = 0)]
     field_access_exprs = map(fields) do field
         DType = field.type
-        if DType <: CompositeDType
-            offset_calc_expr = quote
-                # offset += 1
-                # TODO: calc dynamically?
-            end
-        end
-        offset_calc_expr = quote
-            offset += sizeof(DType)
-        end
-        return quote
+        offset_calc_expr = if DType <: CompositeDType quote
+            # offset += 1
+            # TODO: calc dynamically?
+            @show "TODO: must calculate composite subfield length dynamically"
+        end else quote
+            offset += sizeof($(DType))
+        end end
+        push!(offset_calc_exprs, offset_calc_expr)
+        expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(offset_calc_exprs...)
-                # TODO: replace Int64 with the actual type and offset
-                return reinterpret($DType, view(getfield(sbe, :buffer), offset:offset+sizeof($DType)))[]
+                $(offset_calc_exprs...) # Just interpolate in offsets for fields passed so far
+                # @show offset:offset+sizeof($DType)
+                return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
             end
         end
+        return expr
     end
-    @eval function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
+    @eval Main @inline function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
+        # @info "getting property"
+        found = false
         $(field_access_exprs...)
-        error(lazy"type has no property $prop")
+        if !found
+            error(lazy"type has no property $prop")
+        end
     end
 
-    # For property setting
-    # construct expressions for each field access 
+    offset_calc_exprs = Expr[:(offset = 0)]
     field_access_exprs = map(fields) do field
-        quote
+        DType = field.type
+        offset_calc_expr = if DType <: CompositeDType quote
+            # offset += 1
+            # TODO: calc dynamically?
+            @show "TODO: must calculate composite subfield length dynamically"
+        end else quote
+            offset += sizeof($(DType))
+        end end
+        push!(offset_calc_exprs, offset_calc_expr)
+        expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                # TODO: replace Int64 with the actual type and offset
-                return reinterpret(Int64, view(getfield(sbe, :buffer), 9:16))[] = value
+                $(offset_calc_exprs...) # Just interpolate in offsets for fields passed so far
+                # @show offset:offset+sizeof($DType)
+                return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
             end
         end
+        return expr
     end
-    @eval function Base.setproperty!(sbe::$(Symbol(message_name)), prop::Symbol, value)
+    @eval Main @inline function Base.setproperty!(sbe::$(Symbol(message_name)), prop::Symbol, value)
+        # @info "getting property"
         $(field_access_exprs...)
         error(lazy"type has no property $prop")
     end
 
-    return @eval $(Symbol(message_name))
+    return @eval Main $(Symbol(message_name))
 end
 
-generate_accessors("image.xml")
+# generate_accessors("../sbe-schemas/image.xml")
 
 end;
