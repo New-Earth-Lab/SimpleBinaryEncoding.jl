@@ -1,4 +1,4 @@
-module SpidersMessageSerDes
+module SimpleBinaryEncoding
 
 using LightXML
 using StaticStrings
@@ -73,7 +73,7 @@ function evalschema(Mod::Module, filename::AbstractString)
         if name(e) == "include"
             # @info "including linked file"
             href = attribute(e, "href")
-            dtype_map = load_dtypes(Mod, href)
+            dtype_map = load_dtypes(Mod, joinpath(dirname(filename), href))
             dtype_map = merge(primitive_type_map, dtype_map)
         end
         if name(e) == "message"
@@ -88,6 +88,7 @@ function evalschema(Mod::Module, filename::AbstractString)
 
     nothing
 end
+export evalschema
 
 function load_dtypes(Mod, href)
     xdoc = parse_file(href)
@@ -144,16 +145,6 @@ function parse_message(e, type_map)
     return fields
 end
 
-# function parse_composite_type(e)
-#     fields = map(child_elements(e)) do field_element
-#         field_name = attribute(field_element, "name")
-#         field_description = attribute(field_element, "description")
-#         field_type = attribute(field_element, "type")
-#         return (;name=field_name, description=field_description, type=field_type)
-#     end
-#     return fields
-# end
-
 function parse_composite_type(element)
     fields = map(child_elements(element)) do field_element
         field_name = attribute(field_element, "name")
@@ -176,7 +167,6 @@ function make_composite_type(Mod, element, fields)
     type_description = attribute(element, "description")
     # @info "Defining composite type" type_name type_description fields
     
-    @show Mod
     @eval Mod begin
         # Put description field into docstring
         $type_description
@@ -201,10 +191,10 @@ function make_composite_type(Mod, element, fields)
     offset_calc_exprs = Expr[:(offset = 0)]
     getfield_exrps = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
-            # offset += 1
-            # TODO: calc dynamically?
-            @show "TODO: must calculate composite subfield length dynamically"
+        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
+        offset_calc_expr = if dynamic_offset quote
+            len = sizeof(sbe.$(Symbol(field.name)))
+            offset += len
         end else quote
             offset += sizeof($(DType))
         end end
@@ -212,14 +202,7 @@ function make_composite_type(Mod, element, fields)
         expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
                 $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
-                # @show offset:offset+sizeof($DType)
-                # if $(DType) <: NTuple{N,Char} where N
-
-                #     return N
-                #     # return @inline reinterpret(NTuple{}, view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
-                # else
-                    return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
-                # end
+                return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
             end
         end
         return expr
@@ -237,10 +220,10 @@ function make_composite_type(Mod, element, fields)
     offset_calc_exprs = Expr[:(offset = 0)]
     setfield_exprs = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
-            # offset += 1
-            # TODO: calc dynamically?
-            @show "TODO: must calculate composite subfield length dynamically"
+        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
+        offset_calc_expr = if dynamic_offset quote
+            len = sizeof(sbe.$(Symbol(field.name)))
+            offset += len
         end else quote
             offset += sizeof($(DType))
         end end
@@ -274,7 +257,7 @@ as described in a schema file as variable length encoded data.
 function make_variable_length_type(Mod, element, fields)
     type_name = attribute(element, "name")
     type_description = attribute(element, "description")
-    @info "Defining variable length type" type_name type_description fields
+    # @info "Defining variable length type" type_name type_description fields
 
     # Check that the definition matches what we support:
     # a single length field followed by a 
@@ -335,7 +318,6 @@ function make_variable_length_type(Mod, element, fields)
     # accomodate the size of this varData, then they will get
     # an out of bounds error when they try to access it.
     @eval Mod function Base.resize!(sbe::$(Symbol(type_name)), len)
-        # TODO: throw error if not right sized at start
         if len < 0
             error("Cannot have a negative length")
         elseif len + $(sizeof(lenfield.type)) > length(getfield(sbe, :buffer))
@@ -388,12 +370,9 @@ function generate_message_type(Mod, message_name, message_description, fields)
     offset_calc_exprs = Expr[:(offset = 0)]
     getprop_exrps = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
-            @info "calculating offset dynamically" $(field.name)
-            @info "test" $(field.name)
-            # len = sizeof(sbe.$(Symbol(field.name)))
-            # @info "done"  len
-            len = 1
+        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
+        offset_calc_expr = if dynamic_offset quote
+            len = sizeof(sbe.$(Symbol(field.name)))
             offset += len
         end else quote
             offset += sizeof($(DType))
@@ -414,7 +393,7 @@ function generate_message_type(Mod, message_name, message_description, fields)
                         )
                      # If we have a variable length field, return it directly?
                     elseif DType <: CompositeDType || DType <: VarLenDType
-                        @info "composite field"
+                        # @info "composite field"
                         :(
                             # Debug:    
                             # @show offset+1:offset+sizeof($BytesType);
@@ -450,10 +429,10 @@ function generate_message_type(Mod, message_name, message_description, fields)
     offset_calc_exprs = Expr[:(offset = 0)]
     setprop_exprs = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
-            # offset += 1
-            # TODO: calc dynamically?
-            @show "TODO: must calculate composite subfield length dynamically"
+        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
+        offset_calc_expr = if dynamic_offset quote
+            len = sizeof(sbe.$(Symbol(field.name)))
+            offset += len
         end else quote
             offset += sizeof($(DType))
         end end
@@ -491,6 +470,5 @@ function generate_message_type(Mod, message_name, message_description, fields)
     return @eval Mod $(Symbol(message_name))
 end
 
-# evalschema("../sbe-schemas/image.xml")
 
 end;

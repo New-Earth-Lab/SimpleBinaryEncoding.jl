@@ -1,5 +1,5 @@
-name = "SpidersMessageSerDes"
-uuid = "25d647a0-ef7d-4da3-8ba8-11abaa3d526c"
+name = "SimpleBinaryEncoding"
+uuid = "165d4630-7e21-4626-b3c2-016fbf5108c4"
 author = "William Thompson"
 
 [deps]
