@@ -3,6 +3,8 @@ module SimpleBinaryEncoding
 using LightXML
 using StaticStrings
 
+function schemainfo end
+
 # Julia chars are UTF8. We want to wrap a simple UInt8 byte
 # with a different type. This type will serve as a sentinal
 # so that char arrays can be handled as StaticStrings.jl 
@@ -67,6 +69,15 @@ function evalschema(Mod::Module, filename::AbstractString)
     xdoc = parse_file(filename)
 
     xroot = root(xdoc)  
+
+    info = (;
+        package=attribute(xroot, "package"),
+        id=parse(Int, attribute(xroot, "id")),
+        version=parse(Int, attribute(xroot, "version")),
+        semanticVersion=attribute(xroot, "semanticVersion"),
+        description=attribute(xroot, "description"),
+        byteOrder=attribute(xroot, "byteOrder"),
+    )
     local dtype_map
     # traverse all its child nodes and print element names
     for e in child_elements(xroot)  # c is an instance of XMLNode
@@ -81,7 +92,7 @@ function evalschema(Mod::Module, filename::AbstractString)
             message_description = attribute(e, "description")
             # @info "message type" message_name message_description
             fields = parse_message(e, dtype_map)
-            generate_message_type(Mod, message_name, message_description, fields)
+            generate_message_type(Mod, message_name, message_description, info, fields)
         end
     end
     free(xdoc)
@@ -340,7 +351,7 @@ Internal.
 Generate a struct that wraps a byte buffer and has an interface
 as described in a schema file 
 """
-function generate_message_type(Mod, message_name, message_description, fields)
+function generate_message_type(Mod, message_name, message_description, info, fields)
     # @info "generate struct " message_name fields
 
     @eval Mod begin
@@ -466,6 +477,10 @@ function generate_message_type(Mod, message_name, message_description, fields)
         $(setprop_exprs...)
         error(lazy"type has no property $prop")
     end
+
+    # Create some accessor functions to query the schemaId, version etc.
+    @eval Mod SimpleBinaryEncoding.schemainfo(::Type{$(Symbol(message_name))}) = $info
+    @eval Mod SimpleBinaryEncoding.schemainfo(sbe::$(Symbol(message_name))) = $info
 
     return @eval Mod $(Symbol(message_name))
 end
