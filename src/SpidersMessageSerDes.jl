@@ -34,8 +34,36 @@ primitive_type_map = Dict(
 )
 
 abstract type CompositeDType end
+abstract type VarLenDType <: AbstractVector{UInt8} end
 
-function generate_accessors(filename)
+"""
+    evalschema(Main, "myschema.xml")
+
+Given an XML file that defines a message in the "simple binary
+encoding" format, create types in the provided module (via `eval`)
+for encoding and decoding data.
+
+If the schema defines
+```xml
+<sbe:message name="Image" id="1" description="Image message format">
+    ...
+</sbe:message>
+```
+Then a struct called `Image` will be defined that wraps
+a byte array and provides an object style interface to it, ideally
+with zero allocation overheads:
+```julia
+evalschema(Main, "image.xml")
+buf = zeros(UInt8, 1000)
+img = Image(buf)
+img.height = 100
+img.height # 0x00000064
+```
+
+Note that with bounds checking enabled (default) this is not "unsafe"
+in any way. It's basically just a struct with a custom memory layout.
+"""
+function evalschema(Mod::Module, filename::AbstractString)
     xdoc = parse_file(filename)
 
     xroot = root(xdoc)  
@@ -43,17 +71,17 @@ function generate_accessors(filename)
     # traverse all its child nodes and print element names
     for e in child_elements(xroot)  # c is an instance of XMLNode
         if name(e) == "include"
-            @info "including linked file"
+            # @info "including linked file"
             href = attribute(e, "href")
-            dtype_map = load_dtypes(href)
+            dtype_map = load_dtypes(Mod, href)
             dtype_map = merge(primitive_type_map, dtype_map)
         end
         if name(e) == "message"
             message_name = attribute(e, "name")
             message_description = attribute(e, "description")
-            @info "message type" message_name message_description
+            # @info "message type" message_name message_description
             fields = parse_message(e, dtype_map)
-            generate_struct(message_name, message_description, fields)
+            generate_message_type(Mod, message_name, message_description, fields)
         end
     end
     free(xdoc)
@@ -61,7 +89,7 @@ function generate_accessors(filename)
     nothing
 end
 
-function load_dtypes(href)
+function load_dtypes(Mod, href)
     xdoc = parse_file(href)
 
     xroot = root(xdoc)  
@@ -77,7 +105,11 @@ function load_dtypes(href)
             # Or check if we are defining a new composite type
             elseif name(e) == "composite"
                 fields = parse_composite_type(e)
-                T = make_composite_type(e, fields)
+                if any(field->field.name == "varData", fields)
+                    T = make_variable_length_type(Mod, e, fields)
+                else
+                    T = make_composite_type(Mod, e, fields)
+                end
             end
             # Handle length field
             if has_attribute(e, "length")
@@ -107,10 +139,8 @@ function parse_message(e, type_map)
         field_name = attribute(field_element, "name")
         field_description = attribute(field_element, "description")
         field_type = attribute(field_element, "type")
-        # TODO: lookup of field type via include 
         return (;name=field_name, description=field_description, type=type_map[field_type])
     end
-    display(fields)
     return fields
 end
 
@@ -133,12 +163,21 @@ function parse_composite_type(element)
     end
     return fields
 end
-function make_composite_type(element, fields)
+
+
+"""
+Internal.
+Generate a struct that wraps a byte buffer and has an interface
+as described in a schema file as a "composite type", basically a
+struct.
+"""
+function make_composite_type(Mod, element, fields)
     type_name = attribute(element, "name")
     type_description = attribute(element, "description")
-    @info "Defining composite type" type_name type_description fields
+    # @info "Defining composite type" type_name type_description fields
     
-    @eval Main begin
+    @show Mod
+    @eval Mod begin
         # Put description field into docstring
         $type_description
         struct $(Symbol(type_name)){T<: AbstractArray{UInt8}} <: $(CompositeDType)
@@ -147,19 +186,13 @@ function make_composite_type(element, fields)
     end
     
     # For autocomplete etc.
-    @eval Main function Base.propertynames(sbe::$(Symbol(type_name)))
+    @eval Mod function Base.propertynames(sbe::$(Symbol(type_name)))
         props = ($(
             (Meta.quot(Symbol(field.name)) for field in fields
         )...),)
         return props
     end
 
-
-    # # If has a varLength and a length field, add a Base.sizeof method.
-    # # TODO:
-    # if has
-
-   
     # The offset to each field must be calculated dynamically at run-
     # time due to the precense of variable length fields.
     # We build up a list of expressions calculating offsets as we go.
@@ -168,7 +201,7 @@ function make_composite_type(element, fields)
     offset_calc_exprs = Expr[:(offset = 0)]
     getfield_exrps = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType quote
+        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
             # offset += 1
             # TODO: calc dynamically?
             @show "TODO: must calculate composite subfield length dynamically"
@@ -178,7 +211,7 @@ function make_composite_type(element, fields)
         push!(offset_calc_exprs, offset_calc_expr)
         expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(offset_calc_exprs...) # Just interpolate in offsets for fields passed so far
+                $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
                 # @show offset:offset+sizeof($DType)
                 # if $(DType) <: NTuple{N,Char} where N
 
@@ -191,18 +224,20 @@ function make_composite_type(element, fields)
         end
         return expr
     end
-    @eval Main @inline function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
+    @eval Mod function Base.sizeof(sbe::$(Symbol(type_name)))
+        $(offset_calc_exprs...)
+        return offset
+    end
+    @eval Mod @inline function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
         # @info "getting property"
         $(getfield_exrps...)
-        if !found
-            error(lazy"type has no property $prop")
-        end
+        error(lazy"type has no property $prop")
     end
 
     offset_calc_exprs = Expr[:(offset = 0)]
     setfield_exprs = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType quote
+        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
             # offset += 1
             # TODO: calc dynamically?
             @show "TODO: must calculate composite subfield length dynamically"
@@ -212,30 +247,121 @@ function make_composite_type(element, fields)
         push!(offset_calc_exprs, offset_calc_expr)
         expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(offset_calc_exprs...) # Just interpolate in offsets for fields passed so far
+                $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
                 # @show offset:offset+sizeof($DType)
                 return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
             end
         end
         return expr
     end
-    @eval Main @inline function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
+    @eval Mod @inline function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
         # @info "getting property"
         $(setfield_exprs...)
         error(lazy"type has no property $prop")
     end
 
 
-    return @eval Main $(Symbol(type_name))
+    return @eval Mod $(Symbol(type_name))
 
 end
 
+
+"""
+Internal.
+Generate a struct that wraps a byte buffer and has an interface
+as described in a schema file as variable length encoded data.
+"""
+function make_variable_length_type(Mod, element, fields)
+    type_name = attribute(element, "name")
+    type_description = attribute(element, "description")
+    @info "Defining variable length type" type_name type_description fields
+
+    # Check that the definition matches what we support:
+    # a single length field followed by a 
+    if length(fields) < 2
+        error("The `length` and `varData` fields are required for variable length types")
+    end
+    if fields[1].name != "length"
+        error("`length`` field must be first")
+    end
+    if fields[2].name != "varData"
+        error("`varData` field must come second")
+    end
+    if length(fields) > 2
+        error("only the `length` and `varData` fields are supported for variable length types")
+    end
+
+    lenfield = fields[1]
+
+    @eval Mod begin
+        # Put description field into docstring
+        $type_description
+        struct $(Symbol(type_name)){B<: AbstractArray{UInt8}} <: $(VarLenDType)
+            buffer::B
+        end
+    end
+
+    @eval Mod Base.parent(sbe::$(Symbol(type_name))) = view(getfield(sbe,:buffer), $(sizeof(lenfield.type))+1:$(sizeof(lenfield.type))+length(sbe))
+    
+    # Forward all functions needed to implement the AbstractArray interface
+    # to the parent array (a view into the buffer of calculated size)
+    funcs = (
+        :size,
+        :getindex,
+        :setindex!,
+        :iterate,
+        :similar,
+        :axes,
+    )
+    for func in funcs
+        @eval Mod Base.$(func)(arr::$(Symbol(type_name)), args...; kwargs...) = Base.$(func)(parent(arr), args...; kwargs...)
+    end
+
+    # For autocomplete etc. Hide internal fields.
+    @eval Mod Base.propertynames(sbe::$(Symbol(type_name))) = tuple()
+
+    @eval Mod function Base.sizeof(sbe::$(Symbol(type_name)))
+        return $(sizeof(lenfield.type)) + length(sbe)
+    end
+    
+    @eval Mod function Base.length(sbe::$(Symbol(type_name)))
+        return reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[]
+    end
+
+    # To set the size of the buffer, we implement Base.resize.
+    # We just change the length field of the composite type.
+    # We do check that the buffer is sufficiently large but 
+    # if the user adjusts the buffer smaller and it can no longer
+    # accomodate the size of this varData, then they will get
+    # an out of bounds error when they try to access it.
+    @eval Mod function Base.resize!(sbe::$(Symbol(type_name)), len)
+        # TODO: throw error if not right sized at start
+        if len < 0
+            error("Cannot have a negative length")
+        elseif len + $(sizeof(lenfield.type)) > length(getfield(sbe, :buffer))
+            error("Backing buffer is too small to accomodate this resize! request.")            
+        end
+        return reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[] = len
+    end
+    
+
+    return @eval Mod $(Symbol(type_name))
+
+end
+
+
+"Return the length of a tuple (statically) given its type"
 tuple_len(::Type{<:NTuple{N, Any}}) where {N} = N
 
-function generate_struct(message_name, message_description, fields)
-    @info "generate struct " message_name fields
+"""
+Internal.
+Generate a struct that wraps a byte buffer and has an interface
+as described in a schema file 
+"""
+function generate_message_type(Mod, message_name, message_description, fields)
+    # @info "generate struct " message_name fields
 
-    @eval Main begin
+    @eval Mod begin
         # Put description field into docstring
         $message_description
         struct $(Symbol(message_name)){T<: AbstractArray{UInt8}}
@@ -244,7 +370,7 @@ function generate_struct(message_name, message_description, fields)
     end
     
     # For autocomplete etc.
-    @eval Main function Base.propertynames(sbe::$(Symbol(message_name)))
+    @eval Mod function Base.propertynames(sbe::$(Symbol(message_name)))
         props = ($(
             (Meta.quot(Symbol(field.name)) for field in fields
         )...),)
@@ -262,10 +388,13 @@ function generate_struct(message_name, message_description, fields)
     offset_calc_exprs = Expr[:(offset = 0)]
     getprop_exrps = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType quote
-            # offset += 1
-            # TODO: calc dynamically?
-            @show "TODO: must calculate composite subfield length dynamically"
+        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
+            @info "calculating offset dynamically" $(field.name)
+            @info "test" $(field.name)
+            # len = sizeof(sbe.$(Symbol(field.name)))
+            # @info "done"  len
+            len = 1
+            offset += len
         end else quote
             offset += sizeof($(DType))
         end end
@@ -279,12 +408,26 @@ function generate_struct(message_name, message_description, fields)
                     if DType <: NTuple{N,ByteChar} where N
                         BytesType = NTuple{tuple_len(DType),UInt8}
                         :(
+                            # Debug:    
                             # @show offset+1:offset+sizeof($BytesType);
                             return @inline $(CStaticString)(reinterpret($BytesType,view(getfield(sbe, :buffer), offset+1:offset+sizeof($(BytesType))))[])
+                        )
+                     # If we have a variable length field, return it directly?
+                    elseif DType <: CompositeDType || DType <: VarLenDType
+                        @info "composite field"
+                        :(
+                            # Debug:    
+                            # @show offset+1:offset+sizeof($BytesType);
+                            # When constructing a composite field, just pass in the remainder of the buffer.
+                            # We don't necessarily know how long it is, so we trust it not to touch 
+                            # past it's own Base.sizeof(data::DType) which may be computed dynamically
+                            # e.g. for variable length data.
+                            return $(DType)(view(getfield(sbe, :buffer), offset+1:length(getfield(sbe, :buffer))))
                         )
                     # Otherwise just directly reinterpret
                     else
                         :(
+                            # Debug:    
                             # @show offset+1:offset+sizeof($DType);
                             return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
                         )
@@ -293,16 +436,21 @@ function generate_struct(message_name, message_description, fields)
             end
         end
     end
-    @eval Main @inline function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
+    @eval Mod @inline function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
         # @info "getting property"
         $(getprop_exrps...)
         error(lazy"type has no property $prop")
     end
 
+    @eval Mod function Base.sizeof(sbe::$(Symbol(message_name)))
+        $(offset_calc_exprs...)
+        return offset
+    end
+
     offset_calc_exprs = Expr[:(offset = 0)]
     setprop_exprs = map(fields) do field
         DType = field.type
-        offset_calc_expr = if DType <: CompositeDType quote
+        offset_calc_expr = if DType <: CompositeDType || DType <: VarLenDType quote
             # offset += 1
             # TODO: calc dynamically?
             @show "TODO: must calculate composite subfield length dynamically"
@@ -334,15 +482,15 @@ function generate_struct(message_name, message_description, fields)
         end
         return expr
     end
-    @eval Main @inline function Base.setproperty!(sbe::$(Symbol(message_name)), prop::Symbol, value)
+    @eval Mod @inline function Base.setproperty!(sbe::$(Symbol(message_name)), prop::Symbol, value)
         # @info "getting property"
         $(setprop_exprs...)
         error(lazy"type has no property $prop")
     end
 
-    return @eval Main $(Symbol(message_name))
+    return @eval Mod $(Symbol(message_name))
 end
 
-# generate_accessors("../sbe-schemas/image.xml")
+# evalschema("../sbe-schemas/image.xml")
 
 end;
