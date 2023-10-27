@@ -373,10 +373,11 @@ function make_variable_length_type(Mod, element, fields)
     # accomodate the size of this varData, then they will get
     # an out of bounds error when they try to access it.
     @eval Mod function Base.resize!(sbe::$(Symbol(type_name)), len)
+        len_needed = len + $(sizeof(lenfield.type))
         if len < 0
             error("Cannot have a negative length")
-        elseif len + $(sizeof(lenfield.type)) > length(getfield(sbe, :buffer))
-            error("Backing buffer is too small to accomodate this resize! request.")            
+        elseif len_needed > length(getfield(sbe, :buffer))
+            error(lazy"Backing buffer is too small to accomodate this data. Backing buffer requires an additional $(len_needed - length(getfield(sbe, :buffer))) bytes of storage.")
         end
         return reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[] = len
     end
