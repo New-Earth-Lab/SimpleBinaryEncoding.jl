@@ -255,7 +255,7 @@ function make_composite_type(Mod, element, fields)
             if prop == $(Meta.quot(Symbol(field.name)))
                 $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
                 # @show offset:offset+sizeof($DType)
-                return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
+                return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[] = value
             end
         end
         return expr
