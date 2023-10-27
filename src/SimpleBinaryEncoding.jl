@@ -309,7 +309,7 @@ function make_composite_type(Mod, element, fields)
         for prop in propertynames(sbe)
             s = string(prop)
             len = length(s)
-            println(io, s, " "^(maxproplen-len), " = ", getproperty(sbe, prop))
+            println(io, s, " "^(maxproplen-len), " = ", repr(getproperty(sbe, prop), context=:compact => true))
         end
     end
 
@@ -400,6 +400,13 @@ function make_variable_length_type(Mod, element, fields)
         return reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[] = len
     end
 
+    # Display it all nicely at REPL
+    @eval Mod function Base.show(io::IO, mime::MIME"text/plain", sbe::$(Symbol(type_name)){T}) where {T}
+        println(io, $(Symbol(type_name)), " variable length view over a $T")
+        println(io, "length = ", length(sbe))
+        print(io, "data   = ")
+        show(io, parent(sbe))
+    end
 
     return @eval Mod $(Symbol(type_name))
 
@@ -591,19 +598,32 @@ function generate_message_type(Mod, message_name, message_description, schema_in
     end
 
     # Display it all nicely at REPL
-    @eval Mod function Base.show(io::IO, ::MIME"text/plain", sbe::$(Symbol(message_name)){T}) where {T}
+    @eval Mod function Base.show(io::IO, mime::MIME"text/plain", sbe::$(Symbol(message_name)){T}) where {T}
+
+        # display header first
+        Base.show(io, mime, sbe.messageHeader)
+        println()
+
         println(io, $(Symbol(message_name)), " view over a $T")
         maxproplen = 0
-        for prop in propertynames(sbe)
+        pns = propertynames(sbe)[2:end]
+        for prop in pns
             len = length(string(prop))
             if len > maxproplen
                 maxproplen = len
             end
         end
-        for prop in propertynames(sbe)
+        for prop in pns
             s = string(prop)
             len = length(s)
-            println(io, s, " "^(maxproplen-len), " = ", getproperty(sbe, prop))
+            val = getproperty(sbe, prop)
+            if isbits(val)
+                println(io, s, " "^(maxproplen-len), " = ", repr(val, context=:compact => true))
+            else
+                println(io, s,  " "^(maxproplen-len), " = ")
+                Base.show(io, mime, val)
+                println()
+            end
         end
     end
 
