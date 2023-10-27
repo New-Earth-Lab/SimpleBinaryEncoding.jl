@@ -470,7 +470,7 @@ function generate_message_type(Mod, message_name, message_description, info, fie
                         BytesType = NTuple{L,UInt8}
                         :(
                             # @show offset+1:offset+sizeof($BytesType);
-                            return @inline reinterpret($BytesType,view(getfield(sbe, :buffer), offset+1:offset+sizeof($(BytesType))))[] = CStaticString{$L}(value)
+                            return @inline reinterpret($BytesType,view(getfield(sbe, :buffer), offset+1:offset+sizeof($(BytesType))))[] = $(CStaticString){$L}(value)
                         )
                      # If we have a variable length field, return it directly?
                     elseif DType <: CompositeDType || DType <: VarLenDType
