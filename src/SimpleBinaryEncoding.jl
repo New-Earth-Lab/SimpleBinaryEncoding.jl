@@ -3,17 +3,18 @@ module SimpleBinaryEncoding
 using LightXML
 using StaticStrings
 
-function schemainfo end
 
 # Julia chars are UTF8. We want to wrap a simple UInt8 byte
 # with a different type. This type will serve as a sentinal
-# so that char arrays can be handled as StaticStrings.jl 
-# StaticStrings with zero allocations.
+# so that char arrays can be handled using StaticStrings.jl 
+# with zero allocations.
 struct ByteChar
     d::UInt8
 end
 # Since we're not actually using the ByteChar besides as a sentinal
 # value there's no need to subtype and implement the AbsractChar interface.
+# Just create conversion functions to map back and forth from ByteChar
+# to byte, and NTuple{N,ByteChar} to NTuple{N,UInt8}
 Base.convert(::Type{ByteChar}, c::UInt8) = ByteChar(c)
 Base.convert(::Type{NTuple{N,ByteChar}}, str::CStaticString{N}) where N = Base.convert(
     NTuple{N,ByteChar},
@@ -35,8 +36,19 @@ primitive_type_map = Dict(
     "char" => ByteChar,
 )
 
+abstract type AbstractMessage end
 abstract type CompositeDType end
 abstract type VarLenDType <: AbstractVector{UInt8} end
+
+function schemainfo end
+function templateinfo end
+function blockLength end
+
+blockLength(T::Type{<:Any}) = sizeof(T)
+# blockLength(T::Type{<:VarLenDType}) = error("blockLength for variable length type fell back to generic implementation. Missing method!")
+function blockLength(T::Type{<:VarLenDType})
+    error("blockLength for variable length type fell back to generic implementation. Missing method!")
+end
 
 """
     evalschema(Main, "myschema.xml")
@@ -70,7 +82,7 @@ function evalschema(Mod::Module, filename::AbstractString)
 
     xroot = root(xdoc)  
 
-    info = (;
+    schema_info_nt = (;
         package=attribute(xroot, "package"),
         id=parse(Int, attribute(xroot, "id")),
         version=parse(Int, attribute(xroot, "version")),
@@ -90,9 +102,15 @@ function evalschema(Mod::Module, filename::AbstractString)
         if name(e) == "message"
             message_name = attribute(e, "name")
             message_description = attribute(e, "description")
+            # Create some accessor functions to query the schemaId, version etc.
+            template_info_nt = (;
+                name=message_name,
+                id=parse(Int, attribute(e, "id")),
+                description=message_description,
+            )
             # @info "message type" message_name message_description
             fields = parse_message(e, dtype_map)
-            generate_message_type(Mod, message_name, message_description, info, fields)
+            generate_message_type(Mod, message_name, message_description, schema_info_nt,template_info_nt, fields)
         end
     end
     free(xdoc)
@@ -206,54 +224,53 @@ function make_composite_type(Mod, element, fields)
         return props
     end
 
-    # The offset to each field must be calculated dynamically at run-
-    # time due to the precense of variable length fields.
+    # There are two sizes we need to keep track of. The `blockLength`
+    # which does not include any variable length data, and the
+    # `sizeof` which does. The former can be calculated statically
+    # but the latter must be dynamic, as it will depend on field 
+    # values.
+
     # We build up a list of expressions calculating offsets as we go.
     # Each subsequent field adds their calculation to the offsets as a 
     # new expression.
-    offset_calc_exprs = Expr[:(offset = 0)]
-    getfield_exrps = map(fields) do field
+    blocklen_exprs = Expr[:(blocklen = 0)]
+    sizeof_offset_exprs = Expr[:(offset = 0)]
+    for field in fields
         DType = field.type
+        push!(blocklen_exprs, :(blocklen += $(blockLength)($DType)))
         dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
-        offset_calc_expr = if dynamic_offset quote
-            len = sizeof(sbe.$(Symbol(field.name)))
-            offset += len
-        end else quote
-            offset += sizeof($(DType))
-        end end
-        push!(offset_calc_exprs, offset_calc_expr)
+        offset_calc_expr = if dynamic_offset
+            quote
+                len = sizeof(sbe.$(Symbol(field.name)))
+                offset += len
+            end
+        else
+            quote
+                offset += sizeof($(DType))
+            end
+        end
+        push!(sizeof_offset_exprs, offset_calc_expr)
+    end
+    getprop_exprs = map(enumerate(fields)) do (i,field)
+        DType = field.type
         expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
+                $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
                 return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
             end
         end
         return expr
     end
-    @eval Mod function Base.sizeof(sbe::$(Symbol(type_name)))
-        $(offset_calc_exprs...)
-        return offset
-    end
     @eval Mod @inline function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
         # @info "getting property"
-        $(getfield_exrps...)
+        $(getprop_exprs...)
         error(lazy"type has no property $prop")
     end
-
-    offset_calc_exprs = Expr[:(offset = 0)]
-    setfield_exprs = map(fields) do field
+    setprop_exprs = map(enumerate(fields)) do (i,field)
         DType = field.type
-        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
-        offset_calc_expr = if dynamic_offset quote
-            len = sizeof(sbe.$(Symbol(field.name)))
-            offset += len
-        end else quote
-            offset += sizeof($(DType))
-        end end
-        push!(offset_calc_exprs, offset_calc_expr)
         expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
+                $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
                 # @show offset:offset+sizeof($DType)
                 return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[] = value
             end
@@ -262,13 +279,18 @@ function make_composite_type(Mod, element, fields)
     end
     @eval Mod @inline function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
         # @info "getting property"
-        $(setfield_exprs...)
+        $(setprop_exprs...)
         error(lazy"type has no property $prop")
     end
-
-
+    @eval Mod function Base.sizeof(sbe::$(Symbol(type_name)))
+        $(sizeof_offset_exprs...)
+        return offset
+    end
+    @eval Mod function $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))})
+        $(blocklen_exprs...)
+        return blocklen
+    end
     return @eval Mod $(Symbol(type_name))
-
 end
 
 
@@ -306,6 +328,11 @@ function make_variable_length_type(Mod, element, fields)
             buffer::B
         end
     end
+
+    # The block length is only the length of the fixed "length" parameter type and 
+    # doesn't include the variable length component (wheras `sizeof` does include the
+    # variable length component).
+    @eval Mod $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))}) = $(sizeof(lenfield.type))
 
     @eval Mod Base.parent(sbe::$(Symbol(type_name))) = view(getfield(sbe,:buffer), $(sizeof(lenfield.type))+1:$(sizeof(lenfield.type))+length(sbe))
     
@@ -363,13 +390,13 @@ Internal.
 Generate a struct that wraps a byte buffer and has an interface
 as described in a schema file 
 """
-function generate_message_type(Mod, message_name, message_description, info, fields)
+function generate_message_type(Mod, message_name, message_description, schema_info_nt, template_info_nt, fields)
     # @info "generate struct " message_name fields
 
     @eval Mod begin
         # Put description field into docstring
         $message_description
-        struct $(Symbol(message_name)){T<: AbstractArray{UInt8}}
+        struct $(Symbol(message_name)){T<: AbstractArray{UInt8}} <: $(SimpleBinaryEncoding.AbstractMessage)
             buffer::T
         end
     end
@@ -385,26 +412,42 @@ function generate_message_type(Mod, message_name, message_description, info, fie
     # For property access
     # construct expressions for each field access 
 
+    # pushfirst!(fields, (;name="messageHeader", type=@eval(Mod, messageHeader)))
+    
+    # We build up a list of expressions calculating offsets as we go.
+    # Each subsequent field adds their calculation to the offsets as a 
+    # new expression.
+    blocklen_exprs = Expr[:(blocklen = 0)]
+    sizeof_offset_exprs = Expr[:(offset = 0)]
+    
+    for field in fields
+        DType = field.type
+        push!(blocklen_exprs, :(blocklen += $(blockLength)($DType)))
+        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
+        offset_calc_expr = if dynamic_offset
+            quote
+                len = sizeof(sbe.$(Symbol(field.name)))
+                offset += len
+            end
+        else
+            quote
+                offset += sizeof($(DType))
+            end
+        end
+        push!(sizeof_offset_exprs, offset_calc_expr)
+    end
+
     # The offset to each field must be calculated dynamically at run-
     # time due to the precense of variable length fields.
     # We build up a list of expressions calculating offsets as we go.
     # Each subsequent field adds their calculation to the offsets as a 
     # new expression.
-    offset_calc_exprs = Expr[:(offset = 0)]
-    getprop_exrps = map(fields) do field
+    getprop_exprs = map(enumerate(fields)) do (i,field)
         DType = field.type
-        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
-        offset_calc_expr = if dynamic_offset quote
-            len = sizeof(sbe.$(Symbol(field.name)))
-            offset += len
-        end else quote
-            offset += sizeof($(DType))
-        end end
-        push!(offset_calc_exprs, offset_calc_expr)
         # Create an expression for accessing this property 
         return quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
+                $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
                 $(
                     # If we have a char array, return it as a StaticString.
                     if DType <: NTuple{N,ByteChar} where N
@@ -440,29 +483,20 @@ function generate_message_type(Mod, message_name, message_description, info, fie
     end
     @eval Mod @inline function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
         # @info "getting property"
-        $(getprop_exrps...)
+        $(getprop_exprs...)
         error(lazy"type has no property $prop")
     end
 
     @eval Mod function Base.sizeof(sbe::$(Symbol(message_name)))
-        $(offset_calc_exprs...)
+        $(sizeof_offset_exprs...)
         return offset
     end
 
-    offset_calc_exprs = Expr[:(offset = 0)]
-    setprop_exprs = map(fields) do field
+    setprop_exprs = map(enumerate(fields)) do (i,field)
         DType = field.type
-        dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
-        offset_calc_expr = if dynamic_offset quote
-            len = sizeof(sbe.$(Symbol(field.name)))
-            offset += len
-        end else quote
-            offset += sizeof($(DType))
-        end end
-        push!(offset_calc_exprs, offset_calc_expr)
         expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(offset_calc_exprs[1:end-1]...) # Just interpolate in offsets for fields passed so far
+                $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
                 $(
                     # If we have a char array, return it as a StaticString.
                     if DType <: NTuple{N,ByteChar} where N
@@ -508,8 +542,17 @@ function generate_message_type(Mod, message_name, message_description, info, fie
     end
 
     # Create some accessor functions to query the schemaId, version etc.
-    @eval Mod SimpleBinaryEncoding.schemainfo(::Type{$(Symbol(message_name))}) = $info
-    @eval Mod SimpleBinaryEncoding.schemainfo(sbe::$(Symbol(message_name))) = $info
+    @eval Mod $(SimpleBinaryEncoding).schemainfo(::Type{<:$(Symbol(message_name))}) = $schema_info_nt
+    @eval Mod $(SimpleBinaryEncoding).schemainfo(sbe::$(Symbol(message_name))) = $(SimpleBinaryEncoding).schemainfo(typeof(sbe))
+
+    
+    @eval Mod $(SimpleBinaryEncoding).templateinfo(::Type{<:$(Symbol(message_name))}) = $template_info_nt
+    @eval Mod $(SimpleBinaryEncoding).templateinfo(sbe::$(Symbol(message_name))) = $(SimpleBinaryEncoding).templateinfo(typeof(sbe))
+
+    @eval Mod function $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(message_name))})
+        $(blocklen_exprs...)
+        return blocklen
+    end
 
     return @eval Mod $(Symbol(message_name))
 end
