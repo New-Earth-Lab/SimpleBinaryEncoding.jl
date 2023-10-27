@@ -1,5 +1,5 @@
 # SimpleBinaryEncoding.jl
-Serialization and deserialization to/from binary using the Simple-Binary-Encoding format:
+Zero-copy, zero-allocation serialization and deserialization to/from binary using the Simple-Binary-Encoding format:
 https://github.com/real-logic/simple-binary-encoding
 
 Message types are described by XML schemas. Running `evalschema(MyModule, "myschema.xml")` 
@@ -8,8 +8,9 @@ to access and mutate it as if it were an object, or nested objects, following th
 defintions of the schema.
 
 Current status: basic functionality works but has not been tested outside of the schema formats
-needed in our application.
+needed in our application. Variable length data is supported. Static length strings are supported.
 
+If you find any spurious memory allocations, please file an issue.
 
 ## Examples
 
