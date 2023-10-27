@@ -295,6 +295,24 @@ function make_composite_type(Mod, element, fields)
             return blocklen
         end
     end
+
+    # Display it all nicely at REPL
+    @eval Mod function Base.show(io::IO, ::MIME"text/plain", sbe::$(Symbol(type_name)){T}) where {T}
+        println(io, $(Symbol(type_name)), " view over a $T")
+        maxproplen = 0
+        for prop in propertynames(sbe)
+            len = length(string(prop))
+            if len > maxproplen
+                maxproplen = len
+            end
+        end
+        for prop in propertynames(sbe)
+            s = string(prop)
+            len = length(s)
+            println(io, s, " "^(maxproplen-len), " = ", getproperty(sbe, prop))
+        end
+    end
+
     return @eval Mod $(Symbol(type_name))
 end
 
@@ -570,6 +588,23 @@ function generate_message_type(Mod, message_name, message_description, schema_in
     @eval Mod function $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(message_name))})
         $(blocklen_exprs...)
         return blocklen
+    end
+
+    # Display it all nicely at REPL
+    @eval Mod function Base.show(io::IO, ::MIME"text/plain", sbe::$(Symbol(message_name)){T}) where {T}
+        println(io, $(Symbol(message_name)), " view over a $T")
+        maxproplen = 0
+        for prop in propertynames(sbe)
+            len = length(string(prop))
+            if len > maxproplen
+                maxproplen = len
+            end
+        end
+        for prop in propertynames(sbe)
+            s = string(prop)
+            len = length(s)
+            println(io, s, " "^(maxproplen-len), " = ", getproperty(sbe, prop))
+        end
     end
 
     return @eval Mod $(Symbol(message_name))
