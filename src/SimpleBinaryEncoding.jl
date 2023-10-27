@@ -84,7 +84,7 @@ function evalschema(Mod::Module, filename::AbstractString)
         if name(e) == "include"
             # @info "including linked file"
             href = attribute(e, "href")
-            dtype_map = load_dtypes(Mod, joinpath(dirname(filename), href))
+            dtype_map = load_dtypes_once(Mod, joinpath(dirname(filename), href))
             dtype_map = merge(primitive_type_map, dtype_map)
         end
         if name(e) == "message"
@@ -101,6 +101,18 @@ function evalschema(Mod::Module, filename::AbstractString)
 end
 export evalschema
 
+# We only need to include external files once for any given module we evaluate
+# a schema into. Otherwise we will end up re-defining types that are included
+# by multiple message schemas.
+mod_dtype_map_map = Dict{Tuple{Module,String},Dict}()
+function load_dtypes_once(Mod, href)
+    key = (Mod, href)
+    if haskey(mod_dtype_map_map, key)
+        return mod_dtype_map_map[key]
+    else
+        return mod_dtype_map_map[key] = load_dtypes(Mod, href)
+    end
+end
 function load_dtypes(Mod, href)
     xdoc = parse_file(href)
 
@@ -459,6 +471,23 @@ function generate_message_type(Mod, message_name, message_description, info, fie
                         :(
                             # @show offset+1:offset+sizeof($BytesType);
                             return @inline reinterpret($BytesType,view(getfield(sbe, :buffer), offset+1:offset+sizeof($(BytesType))))[] = CStaticString{$L}(value)
+                        )
+                     # If we have a variable length field, return it directly?
+                    elseif DType <: CompositeDType || DType <: VarLenDType
+                        # @info "composite field"
+                        :(
+                            # Debug:    
+                            # @show offset+1:offset+sizeof($BytesType);
+                            # When constructing a composite field, just pass in the remainder of the buffer.
+                            # We don't necessarily know how long it is, so we trust it not to touch 
+                            # past it's own Base.sizeof(data::DType) which may be computed dynamically
+                            # e.g. for variable length data.
+                            if eltype(value) != UInt8
+                                error("You can only set variable length fields to an array of UInt8")
+                            end;
+                            resize!(sbe.$(Symbol(field.name)), length(value));
+                            sbe.$(Symbol(field.name)) .= value;
+                            return sbe.$(Symbol(field.name));
                         )
                     # Otherwise just directly reinterpret
                     else
