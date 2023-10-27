@@ -286,9 +286,14 @@ function make_composite_type(Mod, element, fields)
         $(sizeof_offset_exprs...)
         return offset
     end
-    @eval Mod function $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))})
-        $(blocklen_exprs...)
-        return blocklen
+    # We don't count the size of the messageHeader in the blockLength of an overall header+message.
+    if type_name == "messageHeader"
+        @eval Mod $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))}) = 0
+    else      
+        @eval Mod function $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))})
+            $(blocklen_exprs...)
+            return blocklen
+        end
     end
     return @eval Mod $(Symbol(type_name))
 end
@@ -332,7 +337,7 @@ function make_variable_length_type(Mod, element, fields)
     # The block length is only the length of the fixed "length" parameter type and 
     # doesn't include the variable length component (wheras `sizeof` does include the
     # variable length component).
-    @eval Mod $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))}) = $(sizeof(lenfield.type))
+    @eval Mod $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))}) = 0 # $(sizeof(lenfield.type))
 
     @eval Mod Base.parent(sbe::$(Symbol(type_name))) = view(getfield(sbe,:buffer), $(sizeof(lenfield.type))+1:$(sizeof(lenfield.type))+length(sbe))
     
@@ -398,8 +403,22 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         $message_description
         struct $(Symbol(message_name)){T<: AbstractArray{UInt8}} <: $(SimpleBinaryEncoding.AbstractMessage)
             buffer::T
+            # Write a constructor that, after initialization, fills in the message header appropriately
+            function $(Symbol(message_name))(buffer)
+                msg = new{typeof(buffer)}(buffer)
+                Msg = typeof(msg)
+                # Set up header
+                msg.messageHeader.schemaId = SimpleBinaryEncoding.schemainfo(Msg).id
+                msg.messageHeader.templateId = SimpleBinaryEncoding.templateinfo(Msg).id
+                msg.messageHeader.blockLength = SimpleBinaryEncoding.blockLength(Msg)
+                return msg
+            end
         end
     end
+
+    # We put a message header before our payload to indicate its type and nominal size.
+    # Fake it by making it the first "field" of our struct.
+    fields = vcat([(;name="messageHeader", type=@eval(Mod, messageHeader), description="")], fields)
     
     # For autocomplete etc.
     @eval Mod function Base.propertynames(sbe::$(Symbol(message_name)))
@@ -411,8 +430,6 @@ function generate_message_type(Mod, message_name, message_description, schema_in
 
     # For property access
     # construct expressions for each field access 
-
-    # pushfirst!(fields, (;name="messageHeader", type=@eval(Mod, messageHeader)))
     
     # We build up a list of expressions calculating offsets as we go.
     # Each subsequent field adds their calculation to the offsets as a 
