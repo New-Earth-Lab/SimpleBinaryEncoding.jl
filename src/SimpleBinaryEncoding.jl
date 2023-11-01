@@ -21,7 +21,7 @@ Base.convert(::Type{NTuple{N,ByteChar}}, str::CStaticString{N}) where {N} = Base
     Base.convert(NTuple{N,UInt8}, str)
 )
 
-primitive_type_map = Dict(
+const primitive_type_map = Dict(
     # First value is the julia datatype
     # Second value is the length.
     # -1 means singleton, 0 means variable length, and a positive value means
@@ -85,6 +85,13 @@ function evalschema(Mod::Module, filename::AbstractString)
 
     xroot = root(xdoc)
 
+    # Ensure that if the schema changes, any calling code is invalidated and recompiles
+    @eval Mod Base.include_dependency($filename)
+
+    @eval Mod if !@isdefined _sbe_message_id_map
+        const _sbe_message_id_map = Dict{Tuple{Int,Int},Any}()
+    end
+
     schema_info_nt = (;
         package=attribute(xroot, "package"),
         id=parse(Int, attribute(xroot, "id")),
@@ -117,10 +124,43 @@ function evalschema(Mod::Module, filename::AbstractString)
             )
             # @info "message type" message_name message_description
             fields = parse_message(e, dtype_map)
-            generate_message_type(Mod, message_name, message_description, schema_info_nt, template_info_nt, fields)
+            T = generate_message_type(Mod, message_name, message_description, schema_info_nt, template_info_nt, fields)
+            @eval Mod _sbe_message_id_map[($(schema_info_nt.id),$(template_info_nt.id))] = $T
         end
     end
     free(xdoc)
+
+    # Define a function for them that allows for flexible decoding based 
+    # on the message header id parameter.
+    @eval Mod if !@isdefined sbedecode
+        """
+        decode(data::Vector{UInt8})::AbstractMessage
+
+        Given a data buffer, return an AbstractMessage sub-type that wraps it (zero-copy)
+        and provides access to the underlying fields.
+
+        `SimpleBinaryEncoding.evalschema` must be called first to define one or more 
+        message types.
+
+        This function is type-unstable since it looks up the correct message type by
+        the message ID. For type-stable access, just use the constructors defined
+        from the schema. E.g. if your schema defines
+        ```xml
+        <sbe:message name="ImageMessage" id="1" description="">
+        </sbe:message>
+        ```
+        then simply call `evalschema` once, and then use `ImageMessage(data::Vector{UInt8})`.
+
+        """
+        function sbedecode(buffer::AbstractArray{UInt8})
+            head = messageHeader(buffer)
+            schemaId = head.schemaId
+            templateId = head.templateId
+            return _sbe_message_id_map[(schemaId,templateId)](buffer)
+            # TODO: check id matches in each contructor when wrapping a message.
+            # TODO: check schema id matches.
+        end
+    end
 
     nothing
 end
@@ -136,6 +176,7 @@ function load_dtypes_once(Mod, href)
         return mod_dtype_map_map[key]
     else
         xdoc = parse_file(href)
+        @eval Mod Base.include_dependency($href)
         xroot = root(xdoc)
         return mod_dtype_map_map[key] = load_dtypes(Mod, xroot)
     end
