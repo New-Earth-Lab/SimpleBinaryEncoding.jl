@@ -190,20 +190,32 @@ function parse_message(e, type_map)
         field_name = attribute(field_element, "name")
         field_description = attribute(field_element, "description")
         field_type = attribute(field_element, "type")
+        if has_attribute(field_element, "length")
+            field_length = parse(Int,attribute(field_element, "length"))
+        else
+            field_length = nothing
+        end
         if !haskey(type_map, field_type)
             error("Data type \"$field_type\" not recognized. Valid values are $(join(keys(type_map), ','))")
         end
-        return (; name=field_name, description=field_description, type=type_map[field_type])
+        return (; name=field_name, description=field_description, type=type_map[field_type], length=field_length)
     end
     return fields
 end
 
+# TODO: this is redundant with the above?
 function parse_composite_type(element)
     fields = map(child_elements(element)) do field_element
         field_name = attribute(field_element, "name")
         field_type_name = attribute(field_element, "primitiveType")
+        field_description = attribute(field_element, "description")
         field_type = primitive_type_map[field_type_name]
-        return (; name=field_name, type=field_type)
+        if has_attribute(field_element, "length")
+            field_length = parse(Int128, attribute(field_element, "length"))
+        else
+            field_length = nothing
+        end
+        return (; name=field_name, type=field_type, description=field_description, length=field_length)
     end
     return fields
 end
@@ -488,7 +500,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
 
     # We put a message header before our payload to indicate its type and nominal size.
     # Fake it by making it the first "field" of our struct.
-    fields = vcat([(; name="messageHeader", type=@eval(Mod, messageHeader), description="")], fields)
+    fields = vcat([(; name="messageHeader", type=@eval(Mod, messageHeader), description="", length=nothing)], fields)
 
     # For autocomplete etc.
     @eval Mod function Base.propertynames(sbe::$(Symbol(message_name)))
@@ -506,6 +518,20 @@ function generate_message_type(Mod, message_name, message_description, schema_in
     # new expression.
     blocklen_exprs = Expr[:(blocklen = 0)]
     sizeof_offset_exprs = Expr[:(offset = 0)]
+
+    fields = map(fields) do field
+        DType = field.type
+        # TODO: length
+
+        len = field.length
+        if isnothing(len)
+        elseif len > 0
+            DType = NTuple{len,DType}
+        else
+            error("unsupported length field $len")
+        end
+        return (;field..., type=DType)
+    end
 
     for field in fields
         DType = field.type
