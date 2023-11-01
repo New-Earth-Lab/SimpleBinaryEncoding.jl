@@ -30,6 +30,9 @@ primitive_type_map = Dict(
     "uint16" => UInt16,
     "uint32" => UInt32,
     "uint64" => UInt64,
+    "int8" => Int8,
+    "int16" => Int16,
+    "int32" => Int32,
     "int64" => Int64,
     # We need some special handling to get char arrays appearing as strings
     # via StaticStrings with zero allocations.
@@ -90,14 +93,18 @@ function evalschema(Mod::Module, filename::AbstractString)
         description=attribute(xroot, "description"),
         byteOrder=attribute(xroot, "byteOrder")
     )
-    local dtype_map
+    dtype_map = primitive_type_map
     # traverse all its child nodes and print element names
     for e in child_elements(xroot)  # c is an instance of XMLNode
         if name(e) == "include"
             # @info "including linked file"
             href = attribute(e, "href")
-            dtype_map = load_dtypes_once(Mod, joinpath(dirname(filename), href))
-            dtype_map = merge(primitive_type_map, dtype_map)
+            new_dtypes_map = load_dtypes_once(Mod, joinpath(dirname(filename), href))
+            dtype_map = merge(dtype_map, new_dtypes_map)
+        end
+        if name(e) == "types"
+            new_dtypes_map = load_dtypes(Mod, e)
+            dtype_map = merge(dtype_map, new_dtypes_map)
         end
         if name(e) == "message"
             message_name = attribute(e, "name")
@@ -128,15 +135,14 @@ function load_dtypes_once(Mod, href)
     if haskey(mod_dtype_map_map, key)
         return mod_dtype_map_map[key]
     else
-        return mod_dtype_map_map[key] = load_dtypes(Mod, href)
+        xdoc = parse_file(href)
+        xroot = root(xdoc)
+        return mod_dtype_map_map[key] = load_dtypes(Mod, xroot)
     end
 end
-function load_dtypes(Mod, href)
-    xdoc = parse_file(href)
+function load_dtypes(Mod, xroot)
 
-    xroot = root(xdoc)
-
-    type_map = Dict()
+    type_map = Dict{String,Any}()
 
     # traverse all its child nodes and print element names
     for e in child_elements(xroot)  # c is an instance of XMLNode
@@ -170,8 +176,11 @@ function load_dtypes(Mod, href)
             end
             type_map[attribute(e, "name")] = T
         end
+        if name(e) == "enum"
+            T = make_enum_type(Mod, e)
+            type_map[attribute(e, "name")] = T
+        end
     end
-    # dtype_map = 
     return type_map
 end
 
@@ -181,6 +190,9 @@ function parse_message(e, type_map)
         field_name = attribute(field_element, "name")
         field_description = attribute(field_element, "description")
         field_type = attribute(field_element, "type")
+        if !haskey(type_map, field_type)
+            error("Data type \"$field_type\" not recognized. Valid values are $(join(keys(type_map), ','))")
+        end
         return (; name=field_name, description=field_description, type=type_map[field_type])
     end
     return fields
@@ -210,7 +222,7 @@ function make_composite_type(Mod, element, fields)
 
     @eval Mod begin
         # Put description field into docstring
-        $type_description
+        @doc $type_description
         struct $(Symbol(type_name)){T<:AbstractArray{UInt8}} <: $(CompositeDType)
             buffer::T
         end
@@ -346,7 +358,7 @@ function make_variable_length_type(Mod, element, fields)
 
     @eval Mod begin
         # Put description field into docstring
-        $type_description
+        @doc $type_description
         struct $(Symbol(type_name)){B<:AbstractArray{UInt8}} <: $(VarLenDType)
             buffer::B
         end
@@ -413,6 +425,38 @@ function make_variable_length_type(Mod, element, fields)
 end
 
 
+"""
+Internal.
+Generate a struct that wraps a byte buffer and has an interface
+as described in a schema file as variable length encoded data.
+"""
+function make_enum_type(Mod, element)
+    type_name = attribute(element, "name")
+    type_description = attribute(element, "description")
+    encoding_type = attribute(element, "encodingType")
+    T = primitive_type_map[encoding_type]
+
+    validValues = map(child_elements(element)) do value_element
+        name = attribute(value_element, "name")
+        # Parse the value in a format that can losslessly hold any int or uint 64
+        value = parse(Int128,LightXML.content(first(child_nodes(value_element))))
+        return (; name, value)
+    end
+    member_exprs = map(validValues) do (;name, value)
+        return :($(Symbol(name))=$value)
+    end
+    
+    @eval Mod begin
+        # Put description field into docstring
+        @doc $type_description
+        @enum $(Symbol(type_name))::$T $(member_exprs...)
+    end
+    
+    return @eval Mod $(Symbol(type_name))
+end
+
+
+
 "Return the length of a tuple (statically) given its type"
 tuple_len(::Type{<:NTuple{N,Any}}) where {N} = N
 
@@ -426,7 +470,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
 
     @eval Mod begin
         # Put description field into docstring
-        $message_description
+        @doc $message_description
         struct $(Symbol(message_name)){T<:AbstractArray{UInt8}} <: $(SimpleBinaryEncoding.AbstractMessage)
             buffer::T
             # Write a constructor that, after initialization, fills in the message header appropriately
