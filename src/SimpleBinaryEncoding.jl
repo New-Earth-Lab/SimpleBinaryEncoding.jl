@@ -326,7 +326,7 @@ function make_composite_type(Mod, element, fields)
         end
         return expr
     end
-    @eval Mod @inline function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
+    @eval Mod Base.@constprop :aggressive function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
         # @info "getting property"
         $(getprop_exprs...)
         error(lazy"type has no property $prop")
@@ -342,7 +342,7 @@ function make_composite_type(Mod, element, fields)
         end
         return expr
     end
-    @eval Mod @inline function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
+    @eval Mod Base.@constprop :aggressive function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
         # @info "getting property"
         $(setprop_exprs...)
         error(lazy"type has no property $prop")
@@ -562,8 +562,6 @@ function generate_message_type(Mod, message_name, message_description, schema_in
 
     fields = map(fields) do field
         DType = field.type
-        # TODO: length
-
         len = field.length
         if isnothing(len)
         elseif len > 0
@@ -580,7 +578,9 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         dynamic_offset = DType <: CompositeDType || DType <: VarLenDType
         offset_calc_expr = if dynamic_offset
             quote
-                len = sizeof(sbe.$(Symbol(field.name)))
+                # the rest of the buffer, then query it's length
+                varlen_or_composite_element = $(DType)(view(buffer, offset+1:length(buffer)))
+                len = sizeof(varlen_or_composite_element)
                 offset += len
             end
         else
@@ -589,7 +589,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
             end
         end
         push!(sizeof_offset_exprs, offset_calc_expr)
-    end
+    end # This is the problem! it's recursive unless inlined!
 
     # The offset to each field must be calculated dynamically at run-
     # time due to the precense of variable length fields.
@@ -600,8 +600,9 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         DType = field.type
         # Create an expression for accessing this property 
         return quote
+            $(sizeof_offset_exprs[i])
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
+                # $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
                 $(
                     # If we have a char array, return it as a StaticString.
                     if DType <: NTuple{N,ByteChar} where {N}
@@ -609,9 +610,14 @@ function generate_message_type(Mod, message_name, message_description, schema_in
                         :(
                             # Debug:    
                             # @show offset+1:offset+sizeof($BytesType);
-                            return @inline $(CStaticString)(reinterpret($BytesType, view(getfield(sbe, :buffer), offset+1:offset+sizeof($(BytesType))))[])
+                            return @inline $(CStaticString)(reinterpret($BytesType, view(buffer, offset+1:offset+sizeof($(BytesType))))[])
                         )
-                        # If we have a variable length field, return it directly?
+                    # elseif DType <: NTuple{N,T} where {N,T}
+                    #     :(
+                    #         # @show offset+1:offset+sizeof($BytesType);
+                    #         return reinterpret($(eltype(DType)), view(buffer, offset+1:offset+sizeof($(DType))))
+                    #     )
+                    # If we have a variable length field, return it directly?
                     elseif DType <: CompositeDType || DType <: VarLenDType
                         # @info "composite field"
                         :(
@@ -621,27 +627,36 @@ function generate_message_type(Mod, message_name, message_description, schema_in
                             # We don't necessarily know how long it is, so we trust it not to touch 
                             # past it's own Base.sizeof(data::DType) which may be computed dynamically
                             # e.g. for variable length data.
-                            return $(DType)(view(getfield(sbe, :buffer), offset+1:length(getfield(sbe, :buffer))))
+                            return @inline $(DType)(view(buffer, offset+1:length(buffer)))
                         )
                         # Otherwise just directly reinterpret
                     else
                         :(
                             # Debug:    
-                            # @show offset+1:offset+sizeof($DType);
-                            return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
+                            # @show offset+1:offset+sizeof($DType) $DType;
+                            dat = @inline view(buffer, offset+1:offset+sizeof($(DType)));
+                            return @inline reinterpret($(DType), dat)[];
                         )
                     end
                 )
             end
         end
     end
-    @eval Mod @inline function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
+
+    @eval Mod Base.@constprop :aggressive @inline function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
+        buffer = getfield(sbe, :buffer)
+        @boundscheck if length(buffer) < sizeof(sbe)
+            error("Buffer is too small for data")
+        end
         # @info "getting property"
-        $(getprop_exprs...)
-        error(lazy"type has no property $prop")
+        @inbounds begin
+            $(getprop_exprs...)
+        end
+        # error(lazy"type has no property $prop")
     end
 
     @eval Mod function Base.sizeof(sbe::$(Symbol(message_name)))
+        buffer = getfield(sbe, :buffer)
         $(sizeof_offset_exprs...)
         return offset
     end
@@ -658,7 +673,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
                         BytesType = NTuple{L,UInt8}
                         :(
                             # @show offset+1:offset+sizeof($BytesType);
-                            return @inline reinterpret($BytesType, view(getfield(sbe, :buffer), offset+1:offset+sizeof($(BytesType))))[] = $(CStaticString){$L}(value)
+                            return reinterpret($BytesType, view(buffer, offset+1:offset+sizeof($(BytesType))))[] = $(CStaticString){$L}(value)
                         )
                         # If we have a variable length field, return it directly?
                     elseif DType <: CompositeDType || DType <: VarLenDType
@@ -681,7 +696,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
                     else
                         :(
                             # @show offset+1:offset+sizeof($DType);
-                            return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[] = value
+                            return @inline reinterpret($(DType), view(buffer, offset+1:offset+sizeof($(DType))))[] = value
                         )
                     end
                 )
@@ -689,9 +704,14 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         end
         return expr
     end
-    @eval Mod @inline function Base.setproperty!(sbe::$(Symbol(message_name)), prop::Symbol, value)
-        # @info "getting property"
-        $(setprop_exprs...)
+    @eval Mod Base.@constprop :aggressive @inline function Base.setproperty!(sbe::$(Symbol(message_name)), prop::Symbol, value)
+        buffer = getfield(sbe, :buffer)
+        @boundscheck if length(buffer) < sizeof(sbe)
+            error("Buffer is too small for data")
+        end
+        @inbounds begin
+            $(setprop_exprs...)
+        end
         error(lazy"type has no property $prop")
     end
 
