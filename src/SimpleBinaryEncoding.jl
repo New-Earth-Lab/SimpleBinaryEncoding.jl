@@ -527,13 +527,17 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         struct $(Symbol(message_name)){T<:AbstractArray{UInt8}} <: $(SimpleBinaryEncoding.AbstractMessage)
             buffer::T
             # Write a constructor that, after initialization, fills in the message header appropriately
-            function $(Symbol(message_name))(buffer)
-                msg = new{typeof(buffer)}(buffer)
+            function $(Symbol(message_name)){BufferType}(buffer) where BufferType
+                msg = new{BufferType}(buffer)
                 Msg = typeof(msg)
                 # Set up header
                 msg.messageHeader.schemaId = SimpleBinaryEncoding.schemainfo(Msg).id
                 msg.messageHeader.templateId = SimpleBinaryEncoding.templateinfo(Msg).id
                 msg.messageHeader.blockLength = SimpleBinaryEncoding.blockLength(Msg)
+                return msg
+            end
+            function $(Symbol(message_name))(buffer)
+                msg = $(Symbol(message_name)){typeof(buffer)}(buffer)
                 return msg
             end
         end
