@@ -216,6 +216,7 @@ function load_dtypes(Mod, xroot)
                 end
             end
             type_map[attribute(e, "name")] = T
+            # @info "" name =attribute(e, "name") T
         end
         if name(e) == "enum"
             T = make_enum_type(Mod, e)
@@ -252,7 +253,13 @@ function parse_composite_type(element)
         field_description = attribute(field_element, "description")
         field_type = primitive_type_map[field_type_name]
         if has_attribute(field_element, "length")
-            field_length = parse(Int128, attribute(field_element, "length"))
+            field_length = parse(Int, attribute(field_element, "length"))
+                if field_length > 0
+                    field_type = NTuple{field_length,field_type}
+                else
+                    # @info "fields" field_name field_type field_length
+                    # error("unsupported length field $field_length")
+                end
         else
             field_length = nothing
         end
@@ -318,35 +325,117 @@ function make_composite_type(Mod, element, fields)
     end
     getprop_exprs = map(enumerate(fields)) do (i, field)
         DType = field.type
-        expr = quote
+        # Create an expression for accessing this property 
+        return quote
+            $(sizeof_offset_exprs[i])
             if prop == $(Meta.quot(Symbol(field.name)))
-                $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
-                return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[]
+                # $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
+                $(
+                    # If we have a char array, return it as a StaticString.
+                    if DType <: NTuple{N,ByteChar} where {N}
+                        BytesType = NTuple{tuple_len(DType),UInt8}
+                        :(
+                            # Debug:    
+                            # @show offset+1:offset+sizeof($BytesType);
+                            return @inline $(CStaticString)(reinterpret($BytesType, view(buffer, offset+1:offset+sizeof($(BytesType))))[])
+                        )
+                    # elseif DType <: NTuple{N,T} where {N,T}
+                    #     :(
+                    #         # @show offset+1:offset+sizeof($BytesType);
+                    #         return reinterpret($(eltype(DType)), view(buffer, offset+1:offset+sizeof($(DType))))
+                    #     )
+                    # If we have a variable length field, return it directly?
+                    elseif DType <: CompositeDType || DType <: VarLenDType
+                        # @info "composite field"
+                        :(
+                            # Debug:    
+                            # @show "B" offset+1:offset+sizeof($BytesType);
+                            # When constructing a composite field, just pass in the remainder of the buffer.
+                            # We don't necessarily know how long it is, so we trust it not to touch 
+                            # past it's own Base.sizeof(data::DType) which may be computed dynamically
+                            # e.g. for variable length data.
+                            return @inline $(DType)(view(buffer, offset+1:length(buffer)))
+                        )
+                        # Otherwise just directly reinterpret
+                    else
+                        :(
+                            # Debug:    
+                            # @show "C" offset+1:offset+sizeof($DType) $DType;
+                            dat = @inline view(buffer, offset+1:offset+sizeof($(DType)));
+                            return @inline reinterpret($(DType), dat)[];
+                        )
+                    end
+                )
             end
         end
-        return expr
     end
-    @eval Mod Base.@constprop :aggressive function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
+
+    @eval Mod Base.@constprop :aggressive @inline function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
+        buffer = getfield(sbe, :buffer)
+        @boundscheck if length(buffer) < sizeof(sbe)
+            error("Buffer is too small for data")
+        end
         # @info "getting property"
-        $(getprop_exprs...)
+        @inbounds begin
+            $(getprop_exprs...)
+        end
         error(lazy"type has no property $prop")
     end
+
     setprop_exprs = map(enumerate(fields)) do (i, field)
         DType = field.type
         expr = quote
             if prop == $(Meta.quot(Symbol(field.name)))
                 $(sizeof_offset_exprs[1:i]...) # Just interpolate in offsets for fields passed so far
-                # @show offset:offset+sizeof($DType)
-                return @inline reinterpret($(DType), view(getfield(sbe, :buffer), offset+1:offset+sizeof($(DType))))[] = value
+                $(
+                    # If we have a char array, return it as a StaticString.
+                    if DType <: NTuple{N,ByteChar} where {N}
+                        L = tuple_len(DType)
+                        BytesType = NTuple{L,UInt8}
+                        :(
+                            # @show offset+1:offset+sizeof($BytesType);
+                            return reinterpret($BytesType, view(buffer, offset+1:offset+sizeof($(BytesType))))[] = $(CStaticString){$L}(value)
+                        )
+                        # If we have a variable length field, return it directly?
+                    elseif DType <: CompositeDType || DType <: VarLenDType
+                        # @info "composite field"
+                        :(
+                            # Debug:    
+                            # @show offset+1:offset+sizeof($BytesType);
+                            # When constructing a composite field, just pass in the remainder of the buffer.
+                            # We don't necessarily know how long it is, so we trust it not to touch 
+                            # past it's own Base.sizeof(data::DType) which may be computed dynamically
+                            # e.g. for variable length data.
+                            if eltype(value) != UInt8
+                                error("You can only set variable length fields to an array of UInt8")
+                            end;
+                            resize!(sbe.$(Symbol(field.name)), length(value));
+                            sbe.$(Symbol(field.name)) .= value;
+                            return sbe.$(Symbol(field.name))
+                        )
+                        # Otherwise just directly reinterpret
+                    else
+                        :(
+                            # @show offset+1:offset+sizeof($DType);
+                            return @inline reinterpret($(DType), view(buffer, offset+1:offset+sizeof($(DType))))[] = value
+                        )
+                    end
+                )
             end
         end
         return expr
     end
-    @eval Mod Base.@constprop :aggressive function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
-        # @info "getting property"
-        $(setprop_exprs...)
+    @eval Mod Base.@constprop :aggressive @inline function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
+        buffer = getfield(sbe, :buffer)
+        @boundscheck if length(buffer) < sizeof(sbe)
+            error("Buffer is too small for data")
+        end
+        @inbounds begin
+            $(setprop_exprs...)
+        end
         error(lazy"type has no property $prop")
     end
+
     @eval Mod function Base.sizeof(sbe::$(Symbol(type_name)))
         $(sizeof_offset_exprs...)
         return offset
@@ -656,7 +745,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         @inbounds begin
             $(getprop_exprs...)
         end
-        # error(lazy"type has no property $prop")
+        error(lazy"type has no property $prop")
     end
 
     @eval Mod function Base.sizeof(sbe::$(Symbol(message_name)))
