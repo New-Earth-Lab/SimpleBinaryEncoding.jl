@@ -616,17 +616,40 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         struct $(Symbol(message_name)){T<:AbstractArray{UInt8}} <: $(SimpleBinaryEncoding.AbstractMessage)
             buffer::T
             # Write a constructor that, after initialization, fills in the message header appropriately
-            function $(Symbol(message_name)){BufferType}(buffer) where BufferType
+            # If `initialize` is true, fill in schema etc. If initialize is false, check that data matches.
+            # If `initialize` is nothing, check if data is not all zero and assume initialize=true if so.
+            function $(Symbol(message_name)){BufferType}(buffer; initialize::Union{Nothing,Bool}=nothing) where BufferType
                 msg = new{BufferType}(buffer)
                 Msg = typeof(msg)
+                if isnothing(initialize)
+                    doinit = (
+                        msg.messageHeader.schemaId ==
+                        msg.messageHeader.templateId ==
+                        msg.messageHeader.blockLength == 0
+                    )
+                else
+                    doinit = initialize
+                end
                 # Set up header
-                msg.messageHeader.schemaId = SimpleBinaryEncoding.schemainfo(Msg).id
-                msg.messageHeader.templateId = SimpleBinaryEncoding.templateinfo(Msg).id
-                msg.messageHeader.blockLength = SimpleBinaryEncoding.blockLength(Msg)
+                if doinit
+                    msg.messageHeader.schemaId = SimpleBinaryEncoding.schemainfo(Msg).id
+                    msg.messageHeader.templateId = SimpleBinaryEncoding.templateinfo(Msg).id
+                    msg.messageHeader.blockLength = SimpleBinaryEncoding.blockLength(Msg)
+                
+                # This error check is not actually helpful; sometimes we want to wrap data in a message without it matching.
+                # else
+                #     if (
+                #         msg.messageHeader.schemaId != SimpleBinaryEncoding.schemainfo(Msg).id ||
+                #         msg.messageHeader.templateId != SimpleBinaryEncoding.templateinfo(Msg).id ||
+                #         msg.messageHeader.blockLength != SimpleBinaryEncoding.blockLength(Msg)
+                #     )
+                #         error(string($(Symbol(message_name), " was initialized with schemaId, templateId, or blockLength not matching. Set `initialize=true` to override.")))
+                #     end
+                end
                 return msg
             end
-            function $(Symbol(message_name))(buffer)
-                msg = $(Symbol(message_name)){typeof(buffer)}(buffer)
+            function $(Symbol(message_name))(buffer; initialize=nothing)
+                msg = $(Symbol(message_name)){typeof(buffer)}(buffer; initialize)
                 return msg
             end
         end
