@@ -1,7 +1,7 @@
 name = "SimpleBinaryEncoding"
 uuid = "165d4630-7e21-4626-b3c2-016fbf5108c4"
 author = "William Thompson"
-version = "2.0.1"
+version = "2.0.2"
 
 [deps]
 LightXML = "9c8b4983-aa76-5018-a973-4c85ecc9e179"
