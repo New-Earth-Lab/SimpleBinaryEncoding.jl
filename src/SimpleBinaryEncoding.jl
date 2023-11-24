@@ -89,7 +89,8 @@ function evalschema(Mod::Module, filename::AbstractString)
     @eval Mod Base.include_dependency($filename)
 
     @eval Mod if !@isdefined _sbe_message_id_map
-        const _sbe_message_id_map = Dict{Tuple{Int,Int},Any}()
+        const _sbe_message_id_map = Dict{Tuple{Int,Int},Symbol}()
+        const _sbe_message_id_map_type = Dict{Tuple{Int,Int},Any}()
     end
 
     schema_info_nt = (;
@@ -125,7 +126,8 @@ function evalschema(Mod::Module, filename::AbstractString)
             # @info "message type" message_name message_description
             fields = parse_message(e, dtype_map)
             T = generate_message_type(Mod, message_name, message_description, schema_info_nt, template_info_nt, fields)
-            @eval Mod _sbe_message_id_map[($(schema_info_nt.id),$(template_info_nt.id))] = $T
+            @eval Mod _sbe_message_id_map[($(schema_info_nt.id),$(template_info_nt.id))] = $(Meta.quot(Symbol(message_name)))
+            @eval Mod _sbe_message_id_map_type[($(schema_info_nt.id),$(template_info_nt.id))] = $T
         end
     end
     free(xdoc)
@@ -156,9 +158,15 @@ function evalschema(Mod::Module, filename::AbstractString)
             head = messageHeader(buffer)
             schemaId = head.schemaId
             templateId = head.templateId
-            return _sbe_message_id_map[(schemaId,templateId)](buffer)
+            return _sbe_message_id_map_type[(schemaId,templateId)](buffer)
             # TODO: check id matches in each contructor when wrapping a message.
             # TODO: check schema id matches.
+        end
+        function sbemessagename(buffer::AbstractArray{UInt8})
+            head = messageHeader(buffer)
+            schemaId = head.schemaId
+            templateId = head.templateId
+            return _sbe_message_id_map[(schemaId,templateId)]
         end
     end
 
