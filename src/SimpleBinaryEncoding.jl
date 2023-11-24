@@ -535,7 +535,7 @@ function make_variable_length_type(Mod, element, fields)
     end
 
     @eval Mod function Base.length(sbe::$(Symbol(type_name)))
-        return reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[]
+        return Int(reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[])
     end
 
     # To set the size of the buffer, we implement Base.resize.
