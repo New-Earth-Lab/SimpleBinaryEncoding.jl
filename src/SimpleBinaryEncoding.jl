@@ -53,6 +53,21 @@ function blockLength(T::Type{<:VarLenDType})
     error("blockLength for variable length type fell back to generic implementation. Missing method!")
 end
 
+
+function Base.parent(sbe::AbstractMessage)
+    return getfield(sbe, :buffer)
+end
+function Base.parent(sbe::CompositeDType)
+    return getfield(sbe, :buffer)
+end
+function parent_occupied(sbe::AbstractMessage)
+    return view(getfield(sbe, :buffer), 1:sizeof(sbe))
+end
+function parent_occupied(sbe::CompositeDType)
+    return view(getfield(sbe, :buffer), 1:sizeof(sbe))
+end
+
+
 """
     evalschema(Main, "myschema.xml")
 
@@ -448,6 +463,7 @@ function make_composite_type(Mod, element, fields)
         $(sizeof_offset_exprs...)
         return offset
     end
+
     # We don't count the size of the messageHeader in the blockLength of an overall header+message.
     if type_name == "messageHeader"
         @eval Mod $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))}) = 0
@@ -784,7 +800,6 @@ function generate_message_type(Mod, message_name, message_description, schema_in
         $(sizeof_offset_exprs...)
         return offset
     end
-
     setprop_exprs = map(enumerate(fields)) do (i, field)
         DType = field.type
         expr = quote
