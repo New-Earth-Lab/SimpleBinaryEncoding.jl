@@ -8,5 +8,5 @@ LightXML = "9c8b4983-aa76-5018-a973-4c85ecc9e179"
 StaticStrings = "4db0a0c5-418a-4e1d-8806-cb305fe13294"
 
 [compat]
-LightXML="0.9.0"
-StaticStrings="0.2.6"
+LightXML="0.9"
+StaticStrings = "0.2"
