@@ -3,6 +3,8 @@ module SimpleBinaryEncoding
 using LightXML
 using StaticStrings
 
+include("null-term-str.jl")
+
 
 # Julia chars are UTF8. We want to wrap a simple UInt8 byte
 # with a different type. This type will serve as a sentinal
@@ -360,7 +362,7 @@ function make_composite_type(Mod, element, fields)
                         :(
                             # Debug:    
                             # @show offset+1:offset+sizeof($BytesType);
-                            return @inline $(CStaticString)(reinterpret($BytesType, view(buffer, offset+1:offset+sizeof($(BytesType))))[])
+                            return @inline $(NullTermString)(view(buffer, offset+1:offset+$(sizeof(BytesType))))
                         )
                     # elseif DType <: NTuple{N,T} where {N,T}
                     #     :(
@@ -750,7 +752,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
                         :(
                             # Debug:    
                             # @show offset+1:offset+sizeof($BytesType);
-                            return @inline $(CStaticString)(reinterpret($BytesType, view(buffer, offset+1:offset+sizeof($(BytesType))))[])
+                            return @inline $(NullTermString)(view(buffer, offset+1:offset+$(sizeof(BytesType))))
                         )
                     # elseif DType <: NTuple{N,T} where {N,T}
                     #     :(
