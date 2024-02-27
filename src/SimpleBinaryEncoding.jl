@@ -370,7 +370,7 @@ function make_composite_type(Mod, element, fields)
                     #         return reinterpret($(eltype(DType)), view(buffer, offset+1:offset+sizeof($(DType))))
                     #     )
                     # If we have a variable length field, return it directly?
-                    elseif DType <: CompositeDType || DType <: VarLenDType
+                    elseif DType <: CompositeDType 
                         # @info "composite field"
                         :(
                             # Debug:    
@@ -380,6 +380,11 @@ function make_composite_type(Mod, element, fields)
                             # past it's own Base.sizeof(data::DType) which may be computed dynamically
                             # e.g. for variable length data.
                             return @inline $(DType)(view(buffer, offset+1:length(buffer)))
+                        )
+                    elseif  DType <: VarLenDType
+                        :(
+                            return @inline $(DType)(view(buffer, offset+1:length(buffer)))
+                            # return @inline view(buffer, offset+1:length(buffer))
                         )
                         # Otherwise just directly reinterpret
                     else
@@ -397,13 +402,8 @@ function make_composite_type(Mod, element, fields)
 
     @eval Mod Base.@constprop :aggressive @inline function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
         buffer = getfield(sbe, :buffer)
-        @boundscheck if length(buffer) < sizeof(sbe)
-            error("Buffer is too small for data")
-        end
         # @info "getting property"
-        @inbounds begin
-            $(getprop_exprs...)
-        end
+        $(getprop_exprs...)
         error(lazy"type has no property $prop")
     end
 
@@ -452,12 +452,7 @@ function make_composite_type(Mod, element, fields)
     end
     @eval Mod Base.@constprop :aggressive @inline function Base.setproperty!(sbe::$(Symbol(type_name)), prop::Symbol, value)
         buffer = getfield(sbe, :buffer)
-        @boundscheck if length(buffer) < sizeof(sbe)
-            error("Buffer is too small for data")
-        end
-        @inbounds begin
-            $(setprop_exprs...)
-        end
+        $(setprop_exprs...)
         error(lazy"type has no property $prop")
     end
 
@@ -537,7 +532,7 @@ function make_variable_length_type(Mod, element, fields)
     # variable length component).
     @eval Mod $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))}) = 0 # $(sizeof(lenfield.type))
 
-    @eval Mod Base.parent(sbe::$(Symbol(type_name))) = view(getfield(sbe, :buffer), $(sizeof(lenfield.type))+1:$(sizeof(lenfield.type))+length(sbe))
+    @eval Mod Base.parent(sbe::$(Symbol(type_name))) = @inbounds view(getfield(sbe, :buffer), $(sizeof(lenfield.type))+1:$(sizeof(lenfield.type))+length(sbe))
 
     # Forward all functions needed to implement the AbstractArray interface
     # to the parent array (a view into the buffer of calculated size)
@@ -548,19 +543,24 @@ function make_variable_length_type(Mod, element, fields)
         :iterate,
         :similar,
         :axes,
+        :IteratorSize,
+        :IteratorEltype,
+        :eltype,
+        :isdone,
+        :eachindex
     )
     for func in funcs
-        @eval Mod Base.$(func)(arr::$(Symbol(type_name)), args...; kwargs...) = Base.$(func)(parent(arr), args...; kwargs...)
+        @eval Mod @inline Base.$(func)(arr::$(Symbol(type_name)), args...; kwargs...) = @inline Base.$(func)(parent(arr), args...; kwargs...)
     end
 
     # For autocomplete etc. Hide internal fields.
     @eval Mod Base.propertynames(sbe::$(Symbol(type_name))) = tuple()
 
-    @eval Mod function Base.sizeof(sbe::$(Symbol(type_name)))
+    @eval Mod @inline function Base.sizeof(sbe::$(Symbol(type_name)))
         return $(sizeof(lenfield.type)) + length(sbe)
     end
 
-    @eval Mod function Base.length(sbe::$(Symbol(type_name)))
+    @eval Mod @inline function Base.length(sbe::$(Symbol(type_name)))
         return Int(reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[])
     end
 
@@ -760,7 +760,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
                     #         return reinterpret($(eltype(DType)), view(buffer, offset+1:offset+sizeof($(DType))))
                     #     )
                     # If we have a variable length field, return it directly?
-                    elseif DType <: CompositeDType || DType <: VarLenDType
+                    elseif DType <: CompositeDType
                         # @info "composite field"
                         :(
                             # Debug:    
@@ -770,6 +770,17 @@ function generate_message_type(Mod, message_name, message_description, schema_in
                             # past it's own Base.sizeof(data::DType) which may be computed dynamically
                             # e.g. for variable length data.
                             return @inline $(DType)(view(buffer, offset+1:length(buffer)))
+                        )
+                    elseif DType <: VarLenDType
+                        :(
+                            # Debug:    
+                            # @show offset+1:offset+sizeof($BytesType);
+                            # When constructing a composite field, just pass in the remainder of the buffer.
+                            # We don't necessarily know how long it is, so we trust it not to touch 
+                            # past it's own Base.sizeof(data::DType) which may be computed dynamically
+                            # e.g. for variable length data.
+                            return @inline $(DType)(view(buffer, offset+1:length(buffer)))
+                            # return @inline view(buffer, offset+1:length(buffer))
                         )
                         # Otherwise just directly reinterpret
                     else
@@ -787,13 +798,8 @@ function generate_message_type(Mod, message_name, message_description, schema_in
 
     @eval Mod Base.@constprop :aggressive @inline function Base.getproperty(sbe::$(Symbol(message_name)), prop::Symbol)
         buffer = getfield(sbe, :buffer)
-        @boundscheck if length(buffer) < sizeof(sbe)
-            error("Buffer is too small for data")
-        end
         # @info "getting property"
-        @inbounds begin
-            $(getprop_exprs...)
-        end
+        $(getprop_exprs...)
         error(lazy"type has no property $prop")
     end
 
@@ -847,12 +853,7 @@ function generate_message_type(Mod, message_name, message_description, schema_in
     end
     @eval Mod Base.@constprop :aggressive @inline function Base.setproperty!(sbe::$(Symbol(message_name)), prop::Symbol, value)
         buffer = getfield(sbe, :buffer)
-        @boundscheck if length(buffer) < sizeof(sbe)
-            error("Buffer is too small for data")
-        end
-        @inbounds begin
-            $(setprop_exprs...)
-        end
+        $(setprop_exprs...)
         error(lazy"type has no property $prop")
     end
 
