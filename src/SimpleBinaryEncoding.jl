@@ -532,29 +532,16 @@ function make_variable_length_type(Mod, element, fields)
     # variable length component).
     @eval Mod $(SimpleBinaryEncoding).blockLength(::Type{<:$(Symbol(type_name))}) = 0 # $(sizeof(lenfield.type))
 
-    @eval Mod Base.parent(sbe::$(Symbol(type_name))) = @inbounds view(getfield(sbe, :buffer), $(sizeof(lenfield.type))+1:$(sizeof(lenfield.type))+length(sbe))
-
-    # Forward all functions needed to implement the AbstractArray interface
-    # to the parent array (a view into the buffer of calculated size)
-    funcs = (
-        :size,
-        :getindex,
-        :setindex!,
-        :iterate,
-        :similar,
-        :axes,
-        :IteratorSize,
-        :IteratorEltype,
-        :eltype,
-        :isdone,
-        :eachindex
-    )
-    for func in funcs
-        @eval Mod @inline Base.$(func)(arr::$(Symbol(type_name)), args...; kwargs...) = @inline Base.$(func)(parent(arr), args...; kwargs...)
+    @eval Mod Base.@constprop :aggressive @inline function Base.getproperty(sbe::$(Symbol(type_name)), prop::Symbol)
+        buffer = getfield(sbe, :buffer)
+        if prop == :data
+            start = $(sizeof(lenfield.type))
+            len = Int(reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:start))[])
+            return view(getfield(sbe, :buffer), start+1:start+len)
+        end
+        error(lazy"type has no property $prop")
     end
 
-    # For autocomplete etc. Hide internal fields.
-    @eval Mod Base.propertynames(sbe::$(Symbol(type_name))) = tuple()
 
     @eval Mod @inline function Base.sizeof(sbe::$(Symbol(type_name)))
         return $(sizeof(lenfield.type)) + length(sbe)
@@ -585,7 +572,7 @@ function make_variable_length_type(Mod, element, fields)
         println(io, $(Symbol(type_name)), " variable length view over a $T")
         println(io, "length = ", length(sbe))
         print(io, "data   = ")
-        show(io, parent(sbe))
+        show(io, sbe.data)
     end
 
     return @eval Mod $(Symbol(type_name))
