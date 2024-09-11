@@ -562,7 +562,7 @@ function make_variable_length_type(Mod, element, fields)
         if len < 0
             error("Cannot have a negative length")
         elseif len_needed > length(getfield(sbe, :buffer))
-            error(lazy"Backing buffer is too small to accommodate this data. Backing buffer requires an additional $(len_needed - length(getfield(sbe, :buffer))) bytes of storage.")
+            error(lazy"Backing buffer is too small to accommodate this data. Backing buffer size = $(length(getfield(sbe, :buffer))), total needed = $len_needed.")
         end
         return reinterpret($(lenfield.type), view(getfield(sbe, :buffer), 1:$(sizeof(lenfield.type))))[] = len
     end
